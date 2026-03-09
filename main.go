@@ -22,6 +22,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -201,21 +203,29 @@ func (r *Registry) handlePublish(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "bad request: crate length: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	crateBytes := make([]byte, crateLen)
-	if _, err := io.ReadFull(req.Body, crateBytes); err != nil {
-		http.Error(w, "bad request: crate body: "+err.Error(), http.StatusBadRequest)
+
+	// Reject if this version is already published (before reading crate body)
+	if exists, err := r.versionExists(ctx, indexPath(meta.Name), meta.Vers); err != nil {
+		http.Error(w, "check index: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else if exists {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{
+			"errors": []map[string]any{{"detail": fmt.Sprintf("%s v%s is already published", meta.Name, meta.Vers)}},
+		})
 		return
 	}
 
-	sum := sha256.Sum256(crateBytes)
-	cksum := hex.EncodeToString(sum[:])
-
-	// Store .crate in GCS
+	// Stream crate body to GCS, computing checksum on the fly
+	hash := sha256.New()
 	cratePath := fmt.Sprintf("crates/%s/%s-%s.crate", meta.Name, meta.Name, meta.Vers)
-	if err := r.gcsWrite(ctx, cratePath, "application/octet-stream", crateBytes); err != nil {
+	crateReader := io.TeeReader(io.LimitReader(req.Body, int64(crateLen)), hash)
+	if err := r.gcsWriteFrom(ctx, cratePath, "application/octet-stream", crateReader); err != nil {
 		http.Error(w, "store crate: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	cksum := hex.EncodeToString(hash.Sum(nil))
 
 	// Build and append index entry
 	deps := make([]IndexDep, 0, len(meta.Deps))
@@ -307,6 +317,28 @@ func indexPath(name string) string {
 	}
 }
 
+// versionExists reports whether the given version is already in the index file.
+func (r *Registry) versionExists(ctx context.Context, path, vers string) (bool, error) {
+	reader, err := r.bucket.Object(path).NewReader(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer reader.Close()
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		var e struct {
+			Vers string `json:"vers"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &e) == nil && e.Vers == vers {
+			return true, nil
+		}
+	}
+	return false, scanner.Err()
+}
+
 // appendIndex reads the existing index file from GCS, appends the new entry,
 // and writes it back. GCS has no native append, so read-modify-write is used.
 func (r *Registry) appendIndex(ctx context.Context, path string, entry []byte) error {
@@ -334,9 +366,13 @@ func (r *Registry) appendIndex(ctx context.Context, path string, entry []byte) e
 }
 
 func (r *Registry) gcsWrite(ctx context.Context, path, contentType string, data []byte) error {
+	return r.gcsWriteFrom(ctx, path, contentType, bytes.NewReader(data))
+}
+
+func (r *Registry) gcsWriteFrom(ctx context.Context, path, contentType string, src io.Reader) error {
 	w := r.bucket.Object(path).NewWriter(ctx)
 	w.ContentType = contentType
-	if _, err := w.Write(data); err != nil {
+	if _, err := io.Copy(w, src); err != nil {
 		w.Close()
 		return err
 	}
