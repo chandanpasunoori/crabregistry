@@ -12,10 +12,12 @@
 //   {bucket}/crates/{name}/{name}-{ver}.crate
 //
 // Environment variables:
-//   GCS_BUCKET  (required) GCS bucket name
-//   BASE_URL    (required) Public base URL of this server, e.g. https://crabregistry.internal
-//   PORT        (default: 8080)
-//   AUTH_TOKEN  (optional) Shared Bearer token required on all requests
+//   GCS_BUCKET    (required) GCS bucket name
+//   BASE_URL      (required) Public base URL of this server, e.g. https://crabregistry.internal
+//   PORT          (default: 8080)
+//   READ_TOKEN      (optional) Bearer token required for index/download requests
+//   WRITE_TOKEN     (optional) Bearer token required for publish requests
+//   INSECURE_DANGER (optional) Set to "i know what i am doing" to disable auth enforcement
 
 package main
 
@@ -86,9 +88,32 @@ type PublishDep struct {
 }
 
 type Registry struct {
-	bucket    *storage.BucketHandle
-	baseURL   string
-	authToken string // optional shared secret
+	bucket     *storage.BucketHandle
+	baseURL    string
+	readToken  string // required for index + download; unless insecure
+	writeToken string // required for publish; unless insecure
+	insecure   bool   // set via INSECURE_DANGER env var to allow unauthenticated access
+}
+
+// checkAuth verifies the Bearer token matches any of the provided tokens.
+// If no tokens are configured and insecure mode is off, the request is rejected.
+func (r *Registry) checkAuth(w http.ResponseWriter, req *http.Request, tokens ...string) bool {
+	got := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+	anyConfigured := false
+	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
+		anyConfigured = true
+		if got == token {
+			return true
+		}
+	}
+	if !anyConfigured && r.insecure {
+		return true
+	}
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	return false
 }
 
 func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -97,19 +122,21 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if r.authToken != "" {
-		got := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
-		if got != r.authToken {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
 	switch {
 	case strings.HasPrefix(req.URL.Path, "/index/"):
+		if !r.checkAuth(w, req, r.readToken, r.writeToken) {
+			return
+		}
 		r.handleIndex(w, req)
 	case req.URL.Path == "/api/v1/crates/new":
+		if !r.checkAuth(w, req, r.writeToken) {
+			return
+		}
 		r.handlePublish(w, req)
 	case strings.HasPrefix(req.URL.Path, "/api/v1/crates/"):
+		if !r.checkAuth(w, req, r.readToken, r.writeToken) {
+			return
+		}
 		r.handleDownload(w, req)
 	default:
 		http.NotFound(w, req)
@@ -337,17 +364,25 @@ func main() {
 	}
 
 	reg := &Registry{
-		bucket:    client.Bucket(bucket),
-		baseURL:   baseURL,
-		authToken: os.Getenv("AUTH_TOKEN"),
+		bucket:     client.Bucket(bucket),
+		baseURL:    baseURL,
+		readToken:  os.Getenv("READ_TOKEN"),
+		writeToken: os.Getenv("WRITE_TOKEN"),
+		insecure:   os.Getenv("INSECURE_DANGER") == "i know what i am doing",
+	}
+
+	if reg.insecure {
+		log.Println("WARNING: authentication disabled via INSECURE_DANGER")
 	}
 
 	// Write config.json to GCS on every startup so it stays in sync with auth settings.
 	// "auth-required": true tells Cargo to send credentials on ALL requests (index + api),
-	// not just the publish API endpoint. Required when AUTH_TOKEN is set.
+	// not just the publish API endpoint.
+	// Auth is required unless insecure mode is on and no read token is configured.
 	configKey := "index/config.json"
+	authRequired := !reg.insecure || reg.readToken != ""
 	var config string
-	if reg.authToken != "" {
+	if authRequired {
 		config = fmt.Sprintf(`{"dl":"%s/api/v1/crates","api":"%s","auth-required":true}`, baseURL, baseURL)
 	} else {
 		config = fmt.Sprintf(`{"dl":"%s/api/v1/crates","api":"%s"}`, baseURL, baseURL)
@@ -355,7 +390,7 @@ func main() {
 	if err := reg.gcsWrite(ctx, configKey, "application/json", []byte(config)); err != nil {
 		log.Fatalf("write config.json: %v", err)
 	}
-	log.Printf("wrote gs://%s/%s (auth-required=%v)", bucket, configKey, reg.authToken != "")
+	log.Printf("wrote gs://%s/%s (auth-required=%v)", bucket, configKey, authRequired)
 
 	log.Printf("cargo-registry listening on :%s  bucket=gs://%s  base=%s", port, bucket, baseURL)
 	log.Fatal(http.ListenAndServe(":"+port, reg))
