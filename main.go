@@ -99,7 +99,6 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if r.authToken != "" {
 		got := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
-		log.Printf("token received: '%s' '%s'='%s'\n", req.URL, got, r.authToken)
 		if got != r.authToken {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
